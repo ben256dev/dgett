@@ -1,0 +1,12 @@
+[Unit]
+Description=dgett
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/dgett --daemon
+KillMode=mixed
+Restart=always
+RuntimeDirectory=dgett
+
+[Install]
+WantedBy=multi-user.target
