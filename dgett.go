@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	_ "io"
@@ -9,13 +10,16 @@ import (
 	"log"
 	"net"
 	"os"
-	_ "os/exec"
+	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strconv"
+	"strings"
 	_ "time"
 )
 
 const sockPath = "/run/dgett/dgett.sock"
+const repoPath = "/var/lib/dgett/repo.git"
 
 func handle(conn net.Conn) {
 	defer conn.Close()
@@ -24,6 +28,48 @@ func handle(conn net.Conn) {
 		line := sc.Text()
 		fmt.Fprintf(conn, "got: %s\n", line)
 	}
+}
+
+func git(env []string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Env = append(os.Environ(), env...)
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func snapshot() (string, error) {
+	gitDir, err := git(nil, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return "", err
+	}
+	idxPath := filepath.Join(gitDir, "dgett-index")
+	defer os.Remove(idxPath)
+	idx := []string{"GIT_INDEX_FILE=" + idxPath}
+
+	if _, err := git(idx, "read-tree", "HEAD"); err != nil {
+		return "", err
+	}
+	if _, err := git(idx, "add", "-A"); err != nil {
+		return "", err
+	}
+	tree, err := git(idx, "write-tree")
+	if err != nil {
+		return "", err
+	}
+	headTree, err := git(nil, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		return "", err
+	}
+	if tree == headTree {
+		return git(nil, "rev-parse", "HEAD")
+	}
+	return git(nil, "commit-tree", tree, "-p", "HEAD", "-m", "dgett snapshot")
+}
+
+func push(commit string) error {
+	_, err := git(nil, "push", "--quiet", repoPath, commit+":refs/dgett/"+commit)
+	return err
 }
 
 func main() {
@@ -63,7 +109,21 @@ func main() {
 			log.Fatal("daemon not running: ", err)
 		}
 		defer conn.Close()
-		fmt.Fprintln(conn, "hello")
+
+		hash, err := snapshot()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		push(hash)
+
+		type Request struct {
+			Cmd string `json:"cmd"`
+			Hash string `json:"hash"`
+		}
+
+		json.NewEncoder(conn).Encode(Request{Cmd: "deploy", Hash: hash})
+
 		reply, _ := bufio.NewReader(conn).ReadString('\n')
 		fmt.Print(reply)
 	}
