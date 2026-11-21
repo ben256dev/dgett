@@ -110,19 +110,31 @@ func main() {
 		}
 		defer conn.Close()
 
-		hash, err := snapshot()
+		dgst, err := snapshot()
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		push(hash)
+		push(dgst)
 
 		type Request struct {
 			Cmd string `json:"cmd"`
-			Hash string `json:"hash"`
+			Dgst string `json:"dgst"`
+			Config string `json:"config"`
 		}
 
-		json.NewEncoder(conn).Encode(Request{Cmd: "deploy", Hash: hash})
+		top, err := git(nil, "rev-parse", "--show-toplevel")
+
+		data, err := os.ReadFile(filepath.Join(top, ".dgett"))
+		if err != nil {
+			log.Fatal("no .dgett file")
+		}
+
+		json.NewEncoder(conn).Encode(Request{
+			Cmd: "deploy",
+			Dgst: dgst,
+			Config: string(data),
+		})
 
 		reply, _ := bufio.NewReader(conn).ReadString('\n')
 		fmt.Print(reply)
