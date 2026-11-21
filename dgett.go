@@ -72,27 +72,60 @@ func push(commit string) error {
 	return err
 }
 
+func create_socket() net.Listener {
+	if err := os.Remove(sockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Fatal(err)
+	}
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		log.Fatal("failed to Listen", sockPath)
+	}
+	g, err := user.LookupGroup("dgett")
+	if err != nil {
+		log.Fatal("lookup group \"dgett\" failed", err)
+	}
+	gid, _ := strconv.Atoi(g.Gid)
+	if err := os.Chown(sockPath, -1, gid); err != nil {
+		log.Fatal(err)
+	}
+	if err := os.Chmod(sockPath, 0o660); err != nil {
+		log.Fatal(err)
+	}
+	return ln
+}
+
+func push_snapshot(conn net.Conn) {
+	dgst, err := snapshot()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	push(dgst)
+
+	type Request struct {
+		Cmd string `json:"cmd"`
+		Dgst string `json:"dgst"`
+		Config string `json:"config"`
+	}
+
+	top, err := git(nil, "rev-parse", "--show-toplevel")
+
+	data, err := os.ReadFile(filepath.Join(top, ".dgett"))
+	if err != nil {
+		log.Fatal("no .dgett file")
+	}
+
+	json.NewEncoder(conn).Encode(Request{
+		Cmd: "deploy",
+		Dgst: dgst,
+		Config: string(data),
+	})
+}
+
 func main() {
 	if len(os.Args) == 2 {
 		if os.Args[1] == "--daemon" {
-			if err := os.Remove(sockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				log.Fatal(err)
-			}
-			ln, err := net.Listen("unix", sockPath)
-			if err != nil {
-				log.Fatal("failed to Listen", sockPath)
-			}
-			g, err := user.LookupGroup("dgett")
-			if err != nil {
-				log.Fatal("lookup group \"dgett\" failed", err)
-			}
-			gid, _ := strconv.Atoi(g.Gid)
-			if err := os.Chown(sockPath, -1, gid); err != nil {
-				log.Fatal(err)
-			}
-			if err := os.Chmod(sockPath, 0o660); err != nil {
-				log.Fatal(err)
-			}
+			ln := create_socket()
 			for {
 				conn, err := ln.Accept()
 				if err != nil {
@@ -110,31 +143,7 @@ func main() {
 		}
 		defer conn.Close()
 
-		dgst, err := snapshot()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		push(dgst)
-
-		type Request struct {
-			Cmd string `json:"cmd"`
-			Dgst string `json:"dgst"`
-			Config string `json:"config"`
-		}
-
-		top, err := git(nil, "rev-parse", "--show-toplevel")
-
-		data, err := os.ReadFile(filepath.Join(top, ".dgett"))
-		if err != nil {
-			log.Fatal("no .dgett file")
-		}
-
-		json.NewEncoder(conn).Encode(Request{
-			Cmd: "deploy",
-			Dgst: dgst,
-			Config: string(data),
-		})
+		push_snapshot(conn)
 
 		reply, _ := bufio.NewReader(conn).ReadString('\n')
 		fmt.Print(reply)
