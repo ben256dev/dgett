@@ -534,6 +534,18 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "--help", "-h":
+		usageMsg := `usage: dgett [COMMAND]...
+  dgett               deploy repo over localhost
+  dgett ls            list managed processes
+  dgett rm            delete a process
+  dgett --daemon      run daemon
+  dgett -h | --help   print this message
+
+A .dgett file must be present to deploy. Templates available with "dgett basic.dgett" and "dgett full.dgett"`
+
+		fmt.Println(usageMsg)
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 	}

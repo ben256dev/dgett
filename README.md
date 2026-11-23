@@ -44,7 +44,7 @@ systemctl status dgett
 journalctl -u dgett -f
 ```
 
-## Update existing dgett systemd service
+## Update existing dgett installation
 
 ```bash
 go build -o dgett . && \
