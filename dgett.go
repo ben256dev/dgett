@@ -1,10 +1,11 @@
 package main
 
 import (
-	"bufio"
+
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/BurntSushi/toml"
 	_ "io"
 	"io/fs"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	_ "time"
@@ -21,13 +23,45 @@ import (
 const sockPath = "/run/dgett/dgett.sock"
 const repoPath = "/var/lib/dgett/repo.git"
 
+type Request struct {
+	Cmd    string `json:"cmd"`
+	Commit string `json:"commit"`
+	Config string `json:"config"`
+}
+
+type Response struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	Hint  string `json:"hint,omitempty"`
+}
+
+type Config struct {
+	Build string `toml:"build"`
+	Run   string `toml:"run"`
+}
+
+const configTemplate = `build = "go build -o app ."
+run = "./app"
+`
+
 func handle(conn net.Conn) {
 	defer conn.Close()
-	sc := bufio.NewScanner(conn)
-	for sc.Scan() {
-		line := sc.Text()
-		fmt.Fprintf(conn, "got: %s\n", line)
+	enc := json.NewEncoder(conn)
+
+	var req Request
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		enc.Encode(Response{Error: "bad request: " + err.Error()})
+		return
 	}
+
+	cfg, resp := validate(req)
+	if resp != nil {
+		enc.Encode(resp)
+		return
+	}
+
+	log.Printf("deploy %s: build=%q run=%q", req.Commit[:7], cfg.Build, cfg.Run)
+	enc.Encode(Response{OK: true})
 }
 
 func git(env []string, args ...string) (string, error) {
@@ -72,6 +106,11 @@ func push(commit string) error {
 	return err
 }
 
+func checkout(commit string) error {
+	_, err := git(nil, "checkout", "--quiet", commit, "--", repoPath)
+	return err
+}
+
 func create_socket() net.Listener {
 	if err := os.Remove(sockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		log.Fatal(err)
@@ -94,19 +133,13 @@ func create_socket() net.Listener {
 	return ln
 }
 
-func push_snapshot(conn net.Conn) {
+func push_snapshot(conn net.Conn) string {
 	dgst, err := snapshot()
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	push(dgst)
-
-	type Request struct {
-		Cmd string `json:"cmd"`
-		Dgst string `json:"dgst"`
-		Config string `json:"config"`
-	}
 
 	top, err := git(nil, "rev-parse", "--show-toplevel")
 
@@ -116,15 +149,62 @@ func push_snapshot(conn net.Conn) {
 	}
 
 	json.NewEncoder(conn).Encode(Request{
-		Cmd: "deploy",
-		Dgst: dgst,
+		Cmd:    "deploy",
+		Commit:   dgst,
 		Config: string(data),
 	})
+
+	return dgst
+}
+
+var hashRegexp = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func validate(req Request) (Config, *Response) {
+	var cfg Config
+
+	if req.Cmd != "deploy" {
+		return cfg, &Response{Error: fmt.Sprintf("unknown command %q", req.Cmd)}
+	}
+
+	if !hashRegexp.MatchString(req.Commit) {
+		return cfg, &Response{Error: fmt.Sprintf("invalid commit %q", req.Commit)}
+	}
+	check := exec.Command("git", "--git-dir="+repoPath, "cat-file", "-e", req.Commit+"^{commit}")
+	if check.Run() != nil {
+		return cfg, &Response{Error: "commit " + req.Commit[:7] + " not in repo, did the push fail?"}
+	}
+
+	if strings.TrimSpace(req.Config) == "" {
+		return cfg, &Response{Error: "missing .dgett", Hint: configTemplate}
+	}
+	md, err := toml.Decode(req.Config, &cfg)
+	var perr toml.ParseError
+	if errors.As(err, &perr) {
+		return cfg, &Response{Error: ".dgett: " + perr.ErrorWithPosition()}
+	}
+	if err != nil {
+		return cfg, &Response{Error: ".dgett " + err.Error()}
+	}
+	if extra := md.Undecoded(); len(extra) > 0 {
+		return cfg, &Response{Error: fmt.Sprintf(".dgett: unknown key %q", extra[0].String()), Hint: configTemplate}
+	}
+	if cfg.Run == "" {
+		return cfg, &Response{Error: ".dgett: run is required", Hint: configTemplate}
+	}
+
+	return cfg, nil
+}
+
+func parsecommand() string {
+	if len(os.Args) < 2 {
+		return ""
+	}
+	return os.Args[1]
 }
 
 func main() {
-	if len(os.Args) == 2 {
-		if os.Args[1] == "--daemon" {
+	switch cmd := parsecommand(); cmd {
+		case "--daemon":
 			ln := create_socket()
 			for {
 				conn, err := ln.Accept()
@@ -133,45 +213,30 @@ func main() {
 				}
 				go handle(conn)
 			}
-		} else {
-			log.Printf("unknown command: %s\n", os.Args[1])
+
+		case "":
+			conn, err := net.Dial("unix", sockPath)
+			if err != nil {
+				log.Fatal("daemon not running: ", err)
+			}
+			defer conn.Close()
+
+			dgst := push_snapshot(conn)
+
+			var resp Response
+			if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+				log.Fatal("no reply from daemon: ", err)
+			}
+			if !resp.OK {
+				fmt.Fprintln(os.Stderr, resp.Error)
+				if resp.Hint != "" {
+					fmt.Fprintf(os.Stderr, "\nexample .dgett:\n%s", resp.Hint)
+				}
+				os.Exit(1)
+			}
+			fmt.Println("deployed", dgst[:7])
+
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		}
-	} else {
-		conn, err := net.Dial("unix", sockPath)
-		if err != nil {
-			log.Fatal("daemon not running: ", err)
-		}
-		defer conn.Close()
-
-		push_snapshot(conn)
-
-		reply, _ := bufio.NewReader(conn).ReadString('\n')
-		fmt.Print(reply)
-	}
-
-	/*
-	name := fmt.Sprintf("%s-%s.log", "ls", time.Now().Format("20060102-150405"))
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	defer f.Close()
-
-	lsCmd := exec.Command("ls")
-	lsCmd.Stdin = os.Stdin
-	lsCmd.Stdout = io.MultiWriter(os.Stdout, f)
-	lsCmd.Stderr = io.MultiWriter(os.Stderr, f)
-
-	err = lsCmd.Run()
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		f.Close()
-		os.Exit(ee.ExitCode())
-	}
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	*/
 }

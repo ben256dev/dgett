@@ -40,7 +40,5 @@ journalctl -u dgett -f
 ```
 go build -o dgett .
 sudo install -m 755 dgett /usr/local/bin/dgett
-sudo install -m 644 dgett.service /etc/systemd/system/dgett.service
-sudo systemctl daemon-reload
 sudo systemctl restart dgett
 ```
