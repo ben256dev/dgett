@@ -45,3 +45,15 @@ pacman = "make"
 apt = "gcc"
 dnf = "gcc"
 pacman = "gcc"
+
+[tools.pandoc]
+apt = "pandoc"
+dnf = "pandoc"
+pacman = "pandoc"
+url = "https://pandoc.org/installing.html"
+
+[tools.convert]
+apt = "imagemagick"
+dnf = "ImageMagick"
+pacman = "imagemagick"
+url = "https://imagemagick.org/script/download.php"

@@ -1,0 +1,7 @@
+# clean deploys:   branch.name.localhost (master is also at name.localhost)
+# dirty deploys:   digest.name.localhost
+name = "myapp"
+master = "main"
+dependencies = ["go"]
+build = "go build -o app ."
+run = "./app"

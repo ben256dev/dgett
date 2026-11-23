@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/BurntSushi/toml"
-	_ "io"
+	"github.com/ben256dev/dgett/dgettenv"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -25,6 +27,9 @@ import (
 	_ "time"
 )
 
+//go:embed templates/*.dgett
+var templates embed.FS
+
 const sockPath = "/run/dgett/dgett.sock"
 const repoPath = "/var/lib/dgett/repo.git"
 
@@ -37,9 +42,15 @@ const (
 	buildsDir = "/var/lib/dgett/builds"
 	runDir    = "/run/dgett"
 	logsDir   = "/var/log/dgett"
+	dataDir   = "/var/lib/dgett/data"
+	envDir    = "/etc/dgett/env"
+	appRunDir = "/run/dgett/apps"
+	keysDir   = "/var/lib/dgett/keys"
 )
 
 var gitMu sync.Mutex
+
+var opMu sync.Mutex
 
 type Deploy struct {
 	Commit  string    `json:"commit"`
@@ -47,6 +58,8 @@ type Deploy struct {
 	Started time.Time `json:"started"`
 	Socket  string    `json:"socket"`
 	Running bool      `json:"running"`
+	Hosts   []string  `json:"hosts,omitempty"`
+	EnvFile string    `json:"env_file"`
 	done    chan struct{}
 }
 
@@ -54,6 +67,10 @@ type Request struct {
 	Cmd    string `json:"cmd"`
 	Commit string `json:"commit"`
 	Config string `json:"config"`
+	Branch string `json:"branch"`
+	Dirty  bool   `json:"dirty"`
+	Repo   string `json:"repo"`
+	App    string `json:"app"`
 }
 
 type Response struct {
@@ -61,9 +78,13 @@ type Response struct {
 	Error   string   `json:"error,omitempty"`
 	Hint    string   `json:"hint,omitempty"`
 	Deploys []Deploy `json:"deploys,omitempty"`
+	URLs     []string `json:"urls,omitempty"`
+	Template string   `json:"template,omitempty"`
 }
 
 type Config struct {
+	Name         string   `toml:"name"`
+	Master       string   `toml:"master"`
 	Dependencies []string `toml:"dependencies"`
 	Build        string   `toml:"build"`
 	Run          string   `toml:"run"`
@@ -125,19 +146,73 @@ func export(commit, dir string) error {
 	return nil
 }
 
-func deploy(commit string, cfg Config) Response {
+func deploy(req Request, cfg Config) Response {
+	p, err := planRoutes(req, cfg)
+	if err != nil {
+		return Response{Error: err.Error()}
+	}
+
 	mu.Lock()
-	_, exists := deploys[commit]
+	d, exists := deploys[req.Commit]
 	mu.Unlock()
-	if exists {
-		return Response{OK: true}
+	if !exists {
+		var resp Response
+		if d, resp = start(req.Commit, p.app, "https://"+p.hosts[0], cfg); d == nil {
+			return resp
+		}
+	}
+
+	urls, err := applyRoutes(d, p)
+	if err != nil {
+		if !exists {
+			stop(req.Commit)
+		}
+		return Response{Error: err.Error()}
+	}
+	return Response{OK: true, URLs: urls}
+}
+
+func appDirs(app string) (data, env string, err error) {
+	if err := os.MkdirAll(dataDir, 0o750); err != nil {
+		return "", "", err
+	}
+	if err := os.Chown(dataDir, 0, int(appCred.Gid)); err != nil {
+		return "", "", err
+	}
+	data = filepath.Join(dataDir, app)
+	if err := os.MkdirAll(data, 0o750); err != nil {
+		return "", "", err
+	}
+	if err := os.Chown(data, int(appCred.Uid), int(appCred.Gid)); err != nil {
+		return "", "", err
+	}
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		return "", "", err
+	}
+	env = filepath.Join(envDir, app+".env")
+	f, err := os.OpenFile(env, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+	if err == nil {
+		f.Close()
+		if err := os.Chown(env, 0, int(appCred.Gid)); err != nil {
+			return "", "", err
+		}
+	} else if !errors.Is(err, fs.ErrExist) {
+		return "", "", err
+	}
+	return data, env, nil
+}
+
+func start(commit, app, url string, cfg Config) (*Deploy, Response) {
+	data, env, err := appDirs(app)
+	if err != nil {
+		return nil, Response{Error: "app folders: " + err.Error()}
 	}
 
 	dir := filepath.Join(buildsDir, commit)
 	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
 		if err := export(commit, dir); err != nil {
 			os.RemoveAll(dir)
-			return Response{Error: "export failed: " + err.Error()}
+			return nil, Response{Error: "export failed: " + err.Error()}
 		}
 	}
 
@@ -147,28 +222,36 @@ func deploy(commit string, cfg Config) Response {
 		build.SysProcAttr = &syscall.SysProcAttr{Credential: appCred}
 		build.Env = append(os.Environ(), "HOME=/var/lib/dgett/home")
 		if out, err := build.CombinedOutput(); err != nil {
-			return Response{Error: "build failed:\n" + string(out)}
+			return nil, Response{Error: "build failed:\n" + string(out)}
 		}
 	}
 
-	os.MkdirAll(runDir, 0o755)
 	os.MkdirAll(logsDir, 0o755)
-	sock := filepath.Join(runDir, commit+".sock")
+	if err := os.MkdirAll(appRunDir, 0o750); err != nil {
+		return nil, Response{Error: "socket folder: " + err.Error()}
+	}
+	if err := os.Chown(appRunDir, int(appCred.Uid), int(appCred.Gid)); err != nil {
+		return nil, Response{Error: "socket folder: " + err.Error()}
+	}
+	sock := filepath.Join(appRunDir, commit+".sock")
+	report := filepath.Join(appRunDir, commit+".report")
 	os.Remove(sock)
+	os.Remove(report)
 
 	logf, err := os.OpenFile(filepath.Join(logsDir, commit+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		return Response{Error: "log file: " + err.Error()}
+		return nil, Response{Error: "log file: " + err.Error()}
 	}
+	logStart, _ := logf.Seek(0, io.SeekEnd)
 
 	run := exec.Command("sh", "-c", cfg.Run)
 	run.Dir = dir
-	run.Env = append(os.Environ(), "DGETT_SOCKET="+sock)
+	run.Env = append(os.Environ(), "DGETT_SOCKET="+sock, "DGETT_DATA="+data, "DGETT_ENV="+env, "DGETT_REPORT="+report, "DGETT_URL="+url)
 	run.Stdout, run.Stderr = logf, logf
 	run.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: appCred}
 	if err := run.Start(); err != nil {
 		logf.Close()
-		return Response{Error: "start failed: " + err.Error()}
+		return nil, Response{Error: "start failed: " + err.Error()}
 	}
 
 	d := &Deploy{
@@ -176,6 +259,7 @@ func deploy(commit string, cfg Config) Response {
 		PID:     run.Process.Pid,
 		Started: time.Now(),
 		Socket:  sock,
+		EnvFile: env,
 		done:    make(chan struct{}),
 	}
 	go func() {
@@ -187,16 +271,113 @@ func deploy(commit string, cfg Config) Response {
 	mu.Lock()
 	deploys[commit] = d
 	mu.Unlock()
-	return Response{OK: true}
+
+	if err := waitSocket(d); err != nil {
+		tail := logTail(commit, logStart, 20)
+		stop(commit)
+		if r, ok := readReport(report, app); ok && len(r.MissingEnv) > 0 {
+			return nil, missingEnvError(r, app)
+		}
+		return nil, Response{Error: "start failed: " + err.Error() + "\n" + tail}
+	}
+	readReport(report, app)
+	return d, Response{OK: true}
+}
+
+func readReport(path, app string) (dgettenv.Report, bool) {
+	var r dgettenv.Report
+	data, err := os.ReadFile(path)
+	os.Remove(path)
+	if err != nil || json.Unmarshal(data, &r) != nil {
+		return r, false
+	}
+	if len(r.Keys) > 0 {
+		if keys, err := json.Marshal(r.Keys); err == nil && os.MkdirAll(keysDir, 0o755) == nil {
+			os.WriteFile(filepath.Join(keysDir, app+".json"), keys, 0o644)
+		}
+	}
+	return r, true
+}
+
+func envTemplate(app string) Response {
+	if label(app) != app || app == "" {
+		return Response{Error: fmt.Sprintf("invalid app name %q", app)}
+	}
+	data, err := os.ReadFile(filepath.Join(keysDir, app+".json"))
+	if err != nil {
+		return Response{Error: "no env template for " + app + " yet, deploy it with dgett first"}
+	}
+	var keys []dgettenv.Key
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return Response{Error: "env template for " + app + ": " + err.Error()}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s\n", filepath.Join(envDir, app+".env"))
+	for _, k := range keys {
+		if k.Required {
+			b.WriteString(k.Name + "=\n")
+		}
+	}
+	b.WriteString("\n")
+	for _, k := range keys {
+		if !k.Required {
+			fmt.Fprintf(&b, "%s=%s\n", k.Name, k.Default)
+		}
+	}
+	return Response{OK: true, Template: b.String()}
+}
+
+func missingEnvError(r dgettenv.Report, app string) Response {
+	const shown = 3
+	var red []string
+	for i, k := range r.MissingEnv {
+		if i == shown {
+			red = append(red, "...")
+			break
+		}
+		red = append(red, "\033[1;31m"+k+"\033[0m")
+	}
+	noun := "env keys"
+	if len(r.MissingEnv) == 1 {
+		noun = "env key"
+	}
+	hint := ""
+	if len(r.Keys) > 0 {
+		hint = fmt.Sprintf("\033[38;5;136m%-40s# for .env template\033[0m\n", "dgett "+app+".env")
+	}
+	if fi, err := os.Stat(r.EnvFile); err == nil && fi.Size() == 0 {
+		return Response{
+			Error: "\033[94m" + r.EnvFile + "\033[0m was automatically created. It is empty and needs populated:",
+			Hint:  hint,
+		}
+	}
+	return Response{
+		Error: fmt.Sprintf("missing \033[1;31m%d\033[0m ", len(r.MissingEnv)) + noun + " " + strings.Join(red, ", ") + " in \033[94m" + r.EnvFile + "\033[0m:",
+		Hint:  hint,
+	}
 }
 
 func remove(commit string) Response {
+	mu.Lock()
+	_, ok := deploys[commit]
+	mu.Unlock()
+	if !ok {
+		return Response{Error: "not deployed: " + commit[:7]}
+	}
+	if err := unroute(commit); err != nil {
+		return Response{Error: err.Error()}
+	}
+	stop(commit)
+	return Response{OK: true}
+}
+
+func stop(commit string) {
 	mu.Lock()
 	d, ok := deploys[commit]
 	delete(deploys, commit)
 	mu.Unlock()
 	if !ok {
-		return Response{Error: "not deployed: " + commit[:7]}
+		return
 	}
 
 	syscall.Kill(-d.PID, syscall.SIGTERM)
@@ -212,8 +393,6 @@ func remove(commit string) Response {
 	os.RemoveAll(filepath.Join(buildsDir, commit))
 	exec.Command("git", "--git-dir="+repoPath, "update-ref", "-d", "refs/dgett/"+commit).Run()
 	gitMu.Unlock()
-
-	return Response{OK: true}
 }
 
 func list() Response {
@@ -228,6 +407,8 @@ func list() Response {
 		default:
 			c.Running = true
 		}
+		c.Hosts = hostsOf(d.Commit)
+		sort.Strings(c.Hosts)
 		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Started.Before(out[j].Started) })
@@ -265,17 +446,26 @@ func handle(conn net.Conn) {
 			if len(missing) == 1 {
 				noun = "dependency"
 			}
-			enc.Encode(Response{Error: "missing " + noun + " " + strings.Join(red, ", ") + " for user \033[94m" + appUser + "@" + host + "\033[0m:", Hint: installHint(missing)})
+			enc.Encode(Response{Error: fmt.Sprintf("missing \033[1;31m%d\033[0m ", len(missing)) + noun + " " + strings.Join(red, ", ") + " for user \033[94m" + appUser + "@" + host + "\033[0m:", Hint: installHint(missing)})
 			return
 		}
-		enc.Encode(deploy(req.Commit, cfg))
+		opMu.Lock()
+		out := deploy(req, cfg)
+		opMu.Unlock()
+		enc.Encode(out)
 
 	case "rm":
 		if resp := checkCommit(req.Commit); resp != nil {
 			enc.Encode(resp)
 			return
 		}
-		enc.Encode(remove(req.Commit))
+		opMu.Lock()
+		resp := remove(req.Commit)
+		opMu.Unlock()
+		enc.Encode(resp)
+
+	case "env":
+		enc.Encode(envTemplate(req.App))
 
 	case "ls":
 		enc.Encode(list())
@@ -293,41 +483,43 @@ func git(env []string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-func snapshot() (string, error) {
+func snapshot() (string, bool, error) {
 	gitDir, err := git(nil, "rev-parse", "--absolute-git-dir")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	idxPath := filepath.Join(gitDir, "dgett-index")
 	defer os.Remove(idxPath)
 	idx := []string{"GIT_INDEX_FILE=" + idxPath}
 
 	if _, err := git(idx, "read-tree", "HEAD"); err != nil {
-		return "", err
+		return "", false, err
 	}
 	if _, err := git(idx, "add", "-A"); err != nil {
-		return "", err
+		return "", false, err
 	}
 	tree, err := git(idx, "write-tree")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	headTree, err := git(nil, "rev-parse", "HEAD^{tree}")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if tree == headTree {
-		return git(nil, "rev-parse", "HEAD")
+		head, err := git(nil, "rev-parse", "HEAD")
+		return head, true, err
 	}
 	date, err := git(nil, "show", "-s", "--format=%cI", "HEAD")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	env := []string{
 		"GIT_AUTHOR_NAME=dgett", "GIT_AUTHOR_EMAIL=dgett@localhost", "GIT_AUTHOR_DATE=" + date,
 		"GIT_COMMITTER_NAME=dgett", "GIT_COMMITTER_EMAIL=dgett@localhost", "GIT_COMMITTER_DATE=" + date,
 	}
-	return git(env, "commit-tree", tree, "-p", "HEAD", "-m", "dgett snapshot")
+	dgst, err := git(env, "commit-tree", tree, "-p", "HEAD", "-m", "dgett snapshot")
+	return dgst, false, err
 }
 
 func push(commit string) error {
@@ -363,10 +555,11 @@ func create_socket() net.Listener {
 }
 
 func push_snapshot(conn net.Conn) string {
-	dgst, err := snapshot()
+	dgst, clean, err := snapshot()
 	if err != nil {
 		log.Fatal(err)
 	}
+	branch, _ := git(nil, "symbolic-ref", "--short", "-q", "HEAD")
 
 	push(dgst)
 
@@ -379,8 +572,11 @@ func push_snapshot(conn net.Conn) string {
 
 	json.NewEncoder(conn).Encode(Request{
 		Cmd:    "deploy",
-		Commit:   dgst,
+		Commit: dgst,
 		Config: string(data),
+		Branch: branch,
+		Dirty:  !clean,
+		Repo:   filepath.Base(top),
 	})
 
 	return dgst
@@ -482,7 +678,7 @@ func main() {
 		}
 		defer conn.Close()
 
-		dgst := push_snapshot(conn)
+		push_snapshot(conn)
 
 		var resp Response
 		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
@@ -495,18 +691,20 @@ func main() {
 			}
 			os.Exit(1)
 		}
-		fmt.Println("deployed", dgst[:7])
+		for _, u := range resp.URLs {
+			fmt.Println(u)
+		}
 
 	case "ls":
 		resp := request(Request{Cmd: "ls"})
 		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "COMMIT\tSTATE\tPID\tSTARTED")
+		fmt.Fprintln(w, "COMMIT\tSTATE\tPID\tSTARTED\tENV\tHOSTS")
 		for _, d := range resp.Deploys {
 			state := "stopped"
 			if d.Running {
 				state = "running"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", d.Commit[:7], state, d.PID, d.Started.Format("2006-01-02 15:04"))
+			fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\n", d.Commit[:7], state, d.PID, d.Started.Format("2006-01-02 15:04"), d.EnvFile, strings.Join(d.Hosts, " "))
 		}
 		w.Flush()
 
@@ -534,11 +732,19 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "basic.dgett", "full.dgett":
+		data, err := templates.ReadFile("templates/" + cmd)
+		if err != nil {
+			log.Fatal(err)
+		}
+		os.Stdout.Write(data)
+
 	case "--help", "-h":
 		usageMsg := `usage: dgett [COMMAND]...
   dgett               deploy repo over localhost
   dgett ls            list managed processes
   dgett rm            delete a process
+  dgett <app>.env     print an env file template for an app
   dgett --daemon      run daemon
   dgett -h | --help   print this message
 
@@ -547,6 +753,10 @@ A .dgett file must be present to deploy. Templates available with "dgett basic.d
 		fmt.Println(usageMsg)
 
 	default:
+		if app, ok := strings.CutSuffix(cmd, ".env"); ok {
+			fmt.Print(request(Request{Cmd: "env", App: app}).Template)
+			return
+		}
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 	}
 }
