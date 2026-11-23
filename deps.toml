@@ -1,0 +1,47 @@
+version = "2026-11-22"
+
+[tools.go]
+apt = "golang-go"
+dnf = "golang"
+pacman = "go"
+url = "https://go.dev/doc/install"
+
+[tools.git]
+apt = "git"
+dnf = "git"
+pacman = "git"
+url = "https://git-scm.com/downloads"
+
+[tools.node]
+apt = "nodejs"
+dnf = "nodejs"
+pacman = "nodejs"
+url = "https://nodejs.org/en/download"
+
+[tools.npm]
+apt = "npm"
+dnf = "npm"
+pacman = "npm"
+url = "https://nodejs.org/en/download"
+
+[tools.python3]
+apt = "python3"
+dnf = "python3"
+pacman = "python"
+url = "https://www.python.org/downloads/"
+
+[tools.cargo]
+apt = "cargo"
+dnf = "cargo"
+pacman = "rust"
+url = "https://rustup.rs"
+
+[tools.make]
+apt = "make"
+dnf = "make"
+pacman = "make"
+
+[tools.gcc]
+apt = "gcc"
+dnf = "gcc"
+pacman = "gcc"
