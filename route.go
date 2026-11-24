@@ -202,19 +202,25 @@ func applyCaddy(changes map[string][]byte) error {
 	return nil
 }
 
-func waitSocket(d *Deploy) error {
-	deadline := time.Now().Add(5 * time.Second)
+func waitSocket(d *Deploy, timeout time.Duration) error {
+	mu.Lock()
+	done := d.done
+	mu.Unlock()
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if fi, err := os.Stat(d.Socket); err == nil && fi.Mode()&fs.ModeSocket != 0 {
+			if err := os.Chown(d.Socket, -1, int(appCred.Gid)); err != nil {
+				return err
+			}
 			return os.Chmod(d.Socket, 0o660)
 		}
 		select {
-		case <-d.done:
+		case <-done:
 			return errors.New("app exited before creating its socket")
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	return errors.New("app did not create " + d.Socket + " within 5s")
+	return fmt.Errorf("app did not create %s within %s", d.Socket, timeout)
 }
 
 func logTail(commit string, from int64, n int) string {

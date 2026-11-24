@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -60,7 +61,11 @@ type Deploy struct {
 	Running bool      `json:"running"`
 	Hosts   []string  `json:"hosts,omitempty"`
 	EnvFile string    `json:"env_file"`
+	Watch   bool      `json:"watch,omitempty"`
+	Branch  string    `json:"branch,omitempty"`
+	Path    string    `json:"path,omitempty"`
 	done    chan struct{}
+	w       *watcher
 }
 
 type Request struct {
@@ -71,6 +76,7 @@ type Request struct {
 	Dirty  bool   `json:"dirty"`
 	Repo   string `json:"repo"`
 	App    string `json:"app"`
+	Path   string `json:"path,omitempty"`
 }
 
 type Response struct {
@@ -88,6 +94,7 @@ type Config struct {
 	Dependencies []string `toml:"dependencies"`
 	Build        string   `toml:"build"`
 	Run          string   `toml:"run"`
+	Watch        []string `toml:"watch"`
 }
 
 const configHint = "\nexample .dgett:\n" + configTemplate
@@ -272,7 +279,7 @@ func start(commit, app, url string, cfg Config) (*Deploy, Response) {
 	deploys[commit] = d
 	mu.Unlock()
 
-	if err := waitSocket(d); err != nil {
+	if err := waitSocket(d, 5*time.Second); err != nil {
 		tail := logTail(commit, logStart, 20)
 		stop(commit)
 		if r, ok := readReport(report, app); ok && len(r.MissingEnv) > 0 {
@@ -345,7 +352,7 @@ func missingEnvError(r dgettenv.Report, app string) Response {
 	if len(r.Keys) > 0 {
 		hint = fmt.Sprintf("\033[38;5;136m%-40s# for .env template\033[0m\n", "dgett "+app+".env")
 	}
-	if fi, err := os.Stat(r.EnvFile); err == nil && fi.Size() == 0 {
+	if fi, err := os.Stat(r.EnvFile); err == nil && fi.Size() == 0 && strings.HasPrefix(r.EnvFile, envDir+"/") {
 		return Response{
 			Error: "\033[94m" + r.EnvFile + "\033[0m was automatically created. It is empty and needs populated:",
 			Hint:  hint,
@@ -362,7 +369,7 @@ func remove(commit string) Response {
 	_, ok := deploys[commit]
 	mu.Unlock()
 	if !ok {
-		return Response{Error: "not deployed: " + commit[:7]}
+		return Response{Error: "not deployed: " + commit}
 	}
 	if err := unroute(commit); err != nil {
 		return Response{Error: err.Error()}
@@ -375,24 +382,39 @@ func stop(commit string) {
 	mu.Lock()
 	d, ok := deploys[commit]
 	delete(deploys, commit)
+	var pid int
+	var done chan struct{}
+	if ok {
+		pid, done = d.PID, d.done
+		if d.w != nil {
+			close(d.w.quit)
+		}
+	}
 	mu.Unlock()
 	if !ok {
 		return
 	}
 
-	syscall.Kill(-d.PID, syscall.SIGTERM)
-	select {
-	case <-d.done:
-	case <-time.After(10 * time.Second):
-		syscall.Kill(-d.PID, syscall.SIGKILL)
-		<-d.done
-	}
+	killGroup(pid, done)
 	os.Remove(d.Socket)
+	if d.w != nil {
+		return
+	}
 
 	gitMu.Lock()
 	os.RemoveAll(filepath.Join(buildsDir, commit))
 	exec.Command("git", "--git-dir="+repoPath, "update-ref", "-d", "refs/dgett/"+commit).Run()
 	gitMu.Unlock()
+}
+
+func killGroup(pid int, done chan struct{}) {
+	syscall.Kill(-pid, syscall.SIGTERM)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		syscall.Kill(-pid, syscall.SIGKILL)
+		<-done
+	}
 }
 
 func list() Response {
@@ -454,10 +476,35 @@ func handle(conn net.Conn) {
 		opMu.Unlock()
 		enc.Encode(out)
 
-	case "rm":
-		if resp := checkCommit(req.Commit); resp != nil {
+	case "watch":
+		cfg, resp := parseConfig(req.Config)
+		if resp != nil {
 			enc.Encode(resp)
 			return
+		}
+		if missing := missingDeps(cfg.Dependencies); len(missing) > 0 {
+			enc.Encode(Response{Error: fmt.Sprintf("missing \033[1;31m%d\033[0m dependencies: ", len(missing)) + strings.Join(missing, ", "), Hint: installHint(missing)})
+			return
+		}
+		uid, err := peerUID(conn)
+		if err != nil {
+			enc.Encode(Response{Error: "peer credentials: " + err.Error()})
+			return
+		}
+		opMu.Lock()
+		out := watchDeploy(req, cfg, uid)
+		opMu.Unlock()
+		enc.Encode(out)
+
+	case "rm":
+		mu.Lock()
+		d := deploys[req.Commit]
+		mu.Unlock()
+		if d == nil || d.w == nil {
+			if resp := checkCommit(req.Commit); resp != nil {
+				enc.Encode(resp)
+				return
+			}
 		}
 		opMu.Lock()
 		resp := remove(req.Commit)
@@ -554,6 +601,33 @@ func create_socket() net.Listener {
 	return ln
 }
 
+func watch_request(conn net.Conn) bool {
+	top, err := git(nil, "rev-parse", "--show-toplevel")
+	if err != nil {
+		log.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(top, ".dgett"))
+	if err != nil {
+		return false
+	}
+	cfg, resp := parseConfig(string(data))
+	if resp != nil {
+		return false
+	}
+	branch, _ := git(nil, "symbolic-ref", "--short", "-q", "HEAD")
+	if !watched(cfg.Watch, branch) {
+		return false
+	}
+	json.NewEncoder(conn).Encode(Request{
+		Cmd:    "watch",
+		Config: string(data),
+		Branch: branch,
+		Repo:   filepath.Base(top),
+		Path:   top,
+	})
+	return true
+}
+
 func push_snapshot(conn net.Conn) string {
 	dgst, clean, err := snapshot()
 	if err != nil {
@@ -624,6 +698,11 @@ func parseConfig(raw string) (Config, *Response) {
 	if cfg.Run == "" {
 		return cfg, &Response{Error: ".dgett: run is required", Hint: configHint}
 	}
+	for _, p := range cfg.Watch {
+		if _, err := pathpkg.Match(p, ""); err != nil {
+			return cfg, &Response{Error: fmt.Sprintf(".dgett: bad watch pattern %q", p)}
+		}
+	}
 	return cfg, nil
 }
 
@@ -678,7 +757,9 @@ func main() {
 		}
 		defer conn.Close()
 
-		push_snapshot(conn)
+		if !watch_request(conn) {
+			push_snapshot(conn)
+		}
 
 		var resp Response
 		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
@@ -704,18 +785,32 @@ func main() {
 			if d.Running {
 				state = "running"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\n", d.Commit[:7], state, d.PID, d.Started.Format("2006-01-02 15:04"), d.EnvFile, strings.Join(d.Hosts, " "))
+			commit := d.Commit
+			if d.Watch {
+				commit = "watch"
+			} else {
+				commit = commit[:7]
+			}
+			fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\n", commit, state, d.PID, d.Started.Format("2006-01-02 15:04"), d.EnvFile, strings.Join(d.Hosts, " "))
 		}
 		w.Flush()
 
 	case "rm":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: dgett rm <commit>")
+			fmt.Fprintln(os.Stderr, "usage: dgett rm <commit|branch>")
 			os.Exit(2)
 		}
 		prefix := os.Args[2]
 		var matches []string
 		for _, d := range request(Request{Cmd: "ls"}).Deploys {
+			if d.Watch {
+				if prefix == d.Branch || prefix == label(d.Branch) {
+					request(Request{Cmd: "rm", Commit: d.Commit})
+					fmt.Println("removed", prefix)
+					return
+				}
+				continue
+			}
 			if strings.HasPrefix(d.Commit, prefix) {
 				matches = append(matches, d.Commit)
 			}
@@ -743,7 +838,7 @@ func main() {
 		usageMsg := `usage: dgett [COMMAND]...
   dgett               deploy repo over localhost
   dgett ls            list managed processes
-  dgett rm            delete a process
+  dgett rm            delete a process by commit or watched branch
   dgett <app>.env     print an env file template for an app
   dgett --daemon      run daemon
   dgett -h | --help   print this message

@@ -1,7 +1,16 @@
-# clean deploys:   branch.name.localhost (master is also at name.localhost)
-# dirty deploys:   digest.name.localhost
+# master branch deployment:             name.localhost
+# other branches:                       branch.name.localhost
+# uncommitted changes:                  digest.name.localhost
+
 name = "myapp"
 master = "main"
+
+watch = ["dev"]
 dependencies = ["go"]
 build = "go build -o app ."
 run = "./app"
+
+# watch:            listed branches will be live deployed as branch.name.localhost
+# dependencies:     deployment dependencies
+# build:            ran when first building the app or on rebuilds
+# run:              ran upon start, resume, or restart
