@@ -52,7 +52,8 @@ journalctl -u dgett -f
 ```bash
 go build -o dgett . && \
 sudo install -m 755 dgett /usr/local/bin/dgett && \
-sudo systemctl restart dgett
+sudo systemctl restart dgett && \
+until [ -S /run/dgett/dgett.sock ]; do sleep 0.2; done
 ```
 
 ## Caddy

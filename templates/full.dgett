@@ -8,6 +8,7 @@ master = "main"
 watch = ["dev"]
 dependencies = ["go"]
 build = "go build -o app ."
+rebuild = "go build -o app ."
 run = "./app"
 
 # watch:            listed branches will be live deployed as branch.name.localhost

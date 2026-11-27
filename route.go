@@ -95,9 +95,13 @@ func planRoutes(req Request, cfg Config) (plan, error) {
 }
 
 func applyRoutes(d *Deploy, p plan) ([]string, error) {
+	upstream := d.Socket
+	if d.w != nil {
+		upstream = proxySock
+	}
 	changes := map[string][]byte{}
 	for _, h := range p.hosts {
-		changes[filepath.Join(caddyDir, p.files[h])] = []byte(fmt.Sprintf("%s {\n\treverse_proxy unix/%s\n}\n", h, d.Socket))
+		changes[filepath.Join(caddyDir, p.files[h])] = []byte(fmt.Sprintf("%s {\n\treverse_proxy unix/%s\n}\n", h, upstream))
 	}
 	if err := applyCaddy(changes); err != nil {
 		return nil, err

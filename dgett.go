@@ -94,6 +94,7 @@ type Config struct {
 	Dependencies []string `toml:"dependencies"`
 	Build        string   `toml:"build"`
 	Run          string   `toml:"run"`
+	Rebuild      string   `toml:"rebuild"`
 	Watch        []string `toml:"watch"`
 }
 
@@ -193,6 +194,13 @@ func appDirs(app string) (data, env string, err error) {
 	if err := os.Chown(data, int(appCred.Uid), int(appCred.Gid)); err != nil {
 		return "", "", err
 	}
+	cache := filepath.Join(cacheDir, app)
+	if err := os.MkdirAll(cache, 0o750); err != nil {
+		return "", "", err
+	}
+	if err := os.Chown(cache, int(appCred.Uid), int(appCred.Gid)); err != nil {
+		return "", "", err
+	}
 	if err := os.MkdirAll(envDir, 0o755); err != nil {
 		return "", "", err
 	}
@@ -223,12 +231,17 @@ func start(commit, app, url string, cfg Config) (*Deploy, Response) {
 		}
 	}
 
+	cache := filepath.Join(cacheDir, app)
+	var buildTime time.Duration
 	if cfg.Build != "" {
 		build := exec.Command("sh", "-c", cfg.Build)
 		build.Dir = dir
 		build.SysProcAttr = &syscall.SysProcAttr{Credential: appCred}
-		build.Env = append(os.Environ(), "HOME=/var/lib/dgett/home")
-		if out, err := build.CombinedOutput(); err != nil {
+		build.Env = append(os.Environ(), "HOME=/var/lib/dgett/home", "DGETT_BUILD=1", "DGETT_CACHE="+cache)
+		t := time.Now()
+		out, err := build.CombinedOutput()
+		buildTime = time.Since(t)
+		if err != nil {
 			return nil, Response{Error: "build failed:\n" + string(out)}
 		}
 	}
@@ -250,10 +263,13 @@ func start(commit, app, url string, cfg Config) (*Deploy, Response) {
 		return nil, Response{Error: "log file: " + err.Error()}
 	}
 	logStart, _ := logf.Seek(0, io.SeekEnd)
+	if cfg.Build != "" {
+		fmt.Fprintf(logf, "dgett: build %.1fs\n", buildTime.Seconds())
+	}
 
 	run := exec.Command("sh", "-c", cfg.Run)
 	run.Dir = dir
-	run.Env = append(os.Environ(), "DGETT_SOCKET="+sock, "DGETT_DATA="+data, "DGETT_ENV="+env, "DGETT_REPORT="+report, "DGETT_URL="+url)
+	run.Env = append(os.Environ(), "DGETT_SOCKET="+sock, "DGETT_DATA="+data, "DGETT_CACHE="+cache, "DGETT_ENV="+env, "DGETT_REPORT="+report, "DGETT_URL="+url)
 	run.Stdout, run.Stderr = logf, logf
 	run.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: appCred}
 	if err := run.Start(); err != nil {
@@ -384,10 +400,12 @@ func stop(commit string) {
 	delete(deploys, commit)
 	var pid int
 	var done chan struct{}
+	var draining []*gen
 	if ok {
 		pid, done = d.PID, d.done
 		if d.w != nil {
 			close(d.w.quit)
+			draining = append(draining, d.w.draining...)
 		}
 	}
 	mu.Unlock()
@@ -395,6 +413,9 @@ func stop(commit string) {
 		return
 	}
 
+	for _, g := range draining {
+		syscall.Kill(-g.pid, syscall.SIGKILL)
+	}
 	killGroup(pid, done)
 	os.Remove(d.Socket)
 	if d.w != nil {
@@ -742,6 +763,7 @@ func main() {
 		loadAppUser()
 
 		ln := create_socket()
+		serveProxy()
 		for {
 			conn, err := ln.Accept()
 			if err != nil {

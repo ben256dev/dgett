@@ -22,7 +22,15 @@ import (
 const (
 	watchRunDir  = "/run/dgett/watch"
 	watchDataDir = "/var/lib/dgett/watch"
+	cacheDir     = "/var/lib/dgett/cache"
 )
+
+// gen is one running generation of a watched app.
+type gen struct {
+	pid  int
+	done chan struct{}
+	sock string
+}
 
 type watcher struct {
 	path   string
@@ -35,10 +43,17 @@ type watcher struct {
 	cred   *syscall.Credential
 	home   string
 	name   string
-	data   string
-	report string
-	last   string
-	quit   chan struct{}
+	data     string
+	cache    string
+	report   string
+	last     string
+	quit     chan struct{}
+	gens     int
+	draining []*gen
+	hub      hub
+	// lastRebuild is how long the last successful rebuild took, from change
+	// detected to swap; sent with "building" as the page's estimate.
+	lastRebuild time.Duration
 }
 
 func watched(patterns []string, branch string) bool {
@@ -123,15 +138,28 @@ func (w *watcher) sig() string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (w *watcher) build() ([]byte, error) {
-	if w.cfg.Build == "" {
+// build runs build on the first start and rebuild (falling back to build)
+// on later restarts.
+func (w *watcher) build(id string, rebuild bool) ([]byte, error) {
+	command := w.cfg.Build
+	if rebuild && w.cfg.Rebuild != "" {
+		command = w.cfg.Rebuild
+	}
+	if command == "" {
 		return nil, nil
 	}
-	cmd := exec.Command("sh", "-c", w.cfg.Build)
+	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = w.path
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: w.cred}
-	cmd.Env = w.env()
-	return cmd.CombinedOutput()
+	cmd.Env = append(w.env(), "DGETT_BUILD=1", "DGETT_CACHE="+w.cache)
+	t := time.Now()
+	out, err := cmd.CombinedOutput()
+	name := "build"
+	if rebuild && w.cfg.Rebuild != "" {
+		name = "rebuild"
+	}
+	w.logf(id, "%s %.1fs", name, time.Since(t).Seconds())
+	return out, err
 }
 
 func (w *watcher) logf(id, format string, args ...any) {
@@ -143,27 +171,28 @@ func (w *watcher) logf(id, format string, args ...any) {
 	fmt.Fprintf(f, "dgett: "+format+"\n", args...)
 }
 
-// launch starts the run command for a watched deploy and swaps the new
-// process into d.
-func launch(d *Deploy) (int64, error) {
-	w := d.w
-	os.Remove(d.Socket)
+// launch starts a new generation of a watched app on its own socket. The
+// current generation keeps running until the caller swaps it out.
+func (w *watcher) launch(id, envFile string) (*gen, int64, error) {
+	w.gens++
+	sock := filepath.Join(watchRunDir, id, fmt.Sprintf("gen-%d.sock", w.gens))
+	os.Remove(sock)
 	os.Remove(w.report)
 	os.MkdirAll(logsDir, 0o755)
-	logf, err := os.OpenFile(filepath.Join(logsDir, d.Commit+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logf, err := os.OpenFile(filepath.Join(logsDir, id+".log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	logStart, _ := logf.Seek(0, 2)
 
 	if _, _, err := appDirs(w.app); err != nil {
 		logf.Close()
-		return 0, err
+		return nil, 0, err
 	}
-	vars, err := godotenv.Read(d.EnvFile)
+	vars, err := godotenv.Read(envFile)
 	if err != nil {
 		logf.Close()
-		return 0, fmt.Errorf("env file %s: %v", d.EnvFile, err)
+		return nil, 0, fmt.Errorf("env file %s: %v", envFile, err)
 	}
 	env := w.env()
 	for k, v := range vars {
@@ -172,23 +201,35 @@ func launch(d *Deploy) (int64, error) {
 
 	run := exec.Command("sh", "-c", w.cfg.Run)
 	run.Dir = w.path
-	run.Env = append(env, "DGETT_SOCKET="+d.Socket, "DGETT_DATA="+w.data, "DGETT_ENV="+os.DevNull, "DGETT_REPORT="+w.report, "DGETT_URL="+w.url)
+	run.Env = append(env, "DGETT_SOCKET="+sock, "DGETT_DATA="+w.data, "DGETT_CACHE="+w.cache, "DGETT_ENV="+os.DevNull, "DGETT_REPORT="+w.report, "DGETT_URL="+w.url)
 	run.Stdout, run.Stderr = logf, logf
 	run.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: w.cred}
 	if err := run.Start(); err != nil {
 		logf.Close()
-		return 0, err
+		return nil, 0, err
 	}
-	done := make(chan struct{})
+	g := &gen{pid: run.Process.Pid, done: make(chan struct{}), sock: sock}
 	go func() {
 		run.Wait()
 		logf.Close()
-		close(done)
+		close(g.done)
 	}()
+	return g, logStart, nil
+}
+
+// drain stops a generation that has been swapped out, letting it finish its
+// in-flight requests first.
+func (w *watcher) drain(g *gen) {
+	killGroup(g.pid, g.done)
+	os.Remove(g.sock)
 	mu.Lock()
-	d.PID, d.done, d.Started = run.Process.Pid, done, time.Now()
+	for i, x := range w.draining {
+		if x == g {
+			w.draining = append(w.draining[:i], w.draining[i+1:]...)
+			break
+		}
+	}
 	mu.Unlock()
-	return logStart, nil
 }
 
 func newWatcher(req Request, cfg Config, uid int, app, url, id string) (*watcher, error) {
@@ -232,6 +273,13 @@ func newWatcher(req Request, cfg Config, uid int, app, url, id string) (*watcher
 	if err := os.Chown(data, uid, gid); err != nil {
 		return nil, err
 	}
+	cache := filepath.Join(cacheDir, id)
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chown(cache, uid, gid); err != nil {
+		return nil, err
+	}
 
 	return &watcher{
 		path:   req.Path,
@@ -245,6 +293,7 @@ func newWatcher(req Request, cfg Config, uid int, app, url, id string) (*watcher
 		home:   u.HomeDir,
 		name:   u.Username,
 		data:   data,
+		cache:  cache,
 		report: filepath.Join(sockDir, "report"),
 		quit:   make(chan struct{}),
 	}, nil
@@ -292,25 +341,29 @@ func watchDeploy(req Request, cfg Config, uid int) Response {
 	if err != nil {
 		return Response{Error: "watch: " + err.Error()}
 	}
-	if out, err := w.build(); err != nil {
+	if out, err := w.build(id, false); err != nil {
 		unroute(id)
 		return Response{Error: "build failed:\n" + string(out)}
 	}
 	w.last = w.sig()
 
-	d := &Deploy{
-		Commit:  id,
-		Watch:   true,
-		Branch:  req.Branch,
-		Path:    req.Path,
-		Socket:  filepath.Join(watchRunDir, id, "app.sock"),
-		EnvFile: filepath.Join(envDir, p.app+".env"),
-		w:       w,
-	}
-	logStart, err := launch(d)
+	envFile := filepath.Join(envDir, p.app+".env")
+	g, logStart, err := w.launch(id, envFile)
 	if err != nil {
 		unroute(id)
 		return Response{Error: "start failed: " + err.Error()}
+	}
+	d := &Deploy{
+		Commit:  id,
+		PID:     g.pid,
+		Started: time.Now(),
+		Watch:   true,
+		Branch:  req.Branch,
+		Path:    req.Path,
+		Socket:  g.sock,
+		EnvFile: envFile,
+		done:    g.done,
+		w:       w,
 	}
 	mu.Lock()
 	deploys[id] = d
@@ -364,33 +417,61 @@ func (w *watcher) loop(d *Deploy) {
 		}
 		time.Sleep(300 * time.Millisecond)
 		w.last = w.sig()
-		w.logf(id, "change detected, restarting")
-		if out, err := w.build(); err != nil {
-			w.logf(id, "build failed, keeping previous version:\n%s", out)
-			w.last = w.sig()
-			continue
-		}
-		w.last = w.sig()
-
-		opMu.Lock()
-		if w.closed() {
-			opMu.Unlock()
-			return
-		}
-		mu.Lock()
-		pid, done := d.PID, d.done
-		mu.Unlock()
-		killGroup(pid, done)
-		_, err := launch(d)
-		opMu.Unlock()
-		if err != nil {
-			w.logf(id, "start failed: %v", err)
-			continue
-		}
-		if err := waitSocket(d, time.Minute); err != nil {
-			w.logf(id, "start failed: %v", err)
-			continue
-		}
-		readReport(w.report, w.app)
+		w.logf(id, "change detected, rebuilding")
+		started := time.Now()
+		w.hub.send("building", fmt.Sprintf(`{"started":%d,"estimate":%d}`, started.UnixMilli(), w.lastRebuild.Milliseconds()))
+		w.restart(d, started)
 	}
+}
+
+// restart builds and starts a new generation while the current one keeps
+// serving, then swaps traffic over and drains the old one.
+func (w *watcher) restart(d *Deploy, started time.Time) {
+	id := d.Commit
+	out, err := w.build(id, true)
+	w.last = w.sig()
+	if err != nil {
+		w.logf(id, "build failed, keeping previous version:\n%s", out)
+		w.hub.send("builderror", "build failed:\n"+string(out))
+		return
+	}
+
+	g, logStart, err := w.launch(id, d.EnvFile)
+	if err != nil {
+		w.logf(id, "start failed: %v", err)
+		w.hub.send("builderror", "start failed: "+err.Error())
+		return
+	}
+	if err := waitSocket(&Deploy{Socket: g.sock, done: g.done}, time.Minute); err != nil {
+		tail := logTail(id, logStart, 20)
+		killGroup(g.pid, g.done)
+		os.Remove(g.sock)
+		msg := "start failed: " + err.Error() + "\n" + tail
+		if r, ok := readReport(w.report, w.app); ok && len(r.MissingEnv) > 0 {
+			msg = "missing env keys in " + d.EnvFile + ": " + strings.Join(r.MissingEnv, ", ")
+		}
+		w.logf(id, "%s, keeping previous version", msg)
+		w.hub.send("builderror", msg)
+		return
+	}
+	readReport(w.report, w.app)
+
+	opMu.Lock()
+	if w.closed() {
+		opMu.Unlock()
+		killGroup(g.pid, g.done)
+		os.Remove(g.sock)
+		return
+	}
+	mu.Lock()
+	old := &gen{pid: d.PID, done: d.done, sock: d.Socket}
+	d.PID, d.done, d.Socket, d.Started = g.pid, g.done, g.sock, time.Now()
+	w.draining = append(w.draining, old)
+	mu.Unlock()
+	opMu.Unlock()
+
+	w.lastRebuild = time.Since(started)
+	w.logf(id, "swapped to %s", filepath.Base(g.sock))
+	w.hub.send("reload", "")
+	go w.drain(old)
 }
